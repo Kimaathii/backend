@@ -35,6 +35,11 @@ export type CreateCreatorRequest = z.infer<typeof CreateCreatorRequestSchema>;
 export type UpdateCreatorRequest = z.infer<typeof UpdateCreatorRequestSchema>;
 export type CreatorPayoutRequest = z.infer<typeof CreatorPayoutSchema>;
 
+export interface CreatorBadge {
+  verified: boolean;
+  type: string;
+}
+
 export interface CreatorResponse {
   id: string;
   userId: string;
@@ -43,6 +48,8 @@ export interface CreatorResponse {
   bio: string | null;
   avatar: string | null;
   verified: boolean;
+  badge?: CreatorBadge | null;
+  verificationBadge?: boolean;
   isPublic: boolean;
   totalEarnings: number;
   pendingBalance: number;

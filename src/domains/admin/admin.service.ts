@@ -593,4 +593,249 @@ export class AdminService extends BaseService {
 
     return !!freeze;
   }
+
+  /**
+   * Bulk refund payments atomically.
+   * Validates that all payments can be refunded before processing any.
+   * If any payment fails validation, the operation fails fast and no refunds are created.
+   * If all are valid, executes refunds atomically in a transaction.
+   */
+  async bulkRefundPayments(
+    adminUserId: string,
+    paymentIds: string[],
+    reason?: string
+  ): Promise<{
+    total: number;
+    refunded: number;
+    failed: number;
+    results: Array<{
+      paymentId: string;
+      status: 'refunded' | 'failed';
+      amount?: number;
+      currency?: string;
+      reason?: string;
+    }>;
+  }> {
+    if (!(await this.isAdmin(adminUserId))) {
+      throw new UnauthorizedError('Only admins can perform bulk refunds');
+    }
+    if (!Array.isArray(paymentIds) || paymentIds.length === 0 || paymentIds.length > 100) {
+      throw new ValidationError('paymentIds must contain between 1 and 100 items');
+    }
+
+    const payments = await this.prisma.payment.findMany({
+      where: { id: { in: paymentIds } },
+      include: { refunds: true },
+    });
+
+    const paymentMap = new Map(payments.map((p) => [p.id, p]));
+    const validationErrors: Array<{ paymentId: string; status: 'failed'; reason: string }> = [];
+
+    // Pre-validate all payments before processing any
+    for (const paymentId of paymentIds) {
+      const payment = paymentMap.get(paymentId);
+      if (!payment) {
+        validationErrors.push({
+          paymentId,
+          status: 'failed',
+          reason: 'Payment not found',
+        });
+        continue;
+      }
+
+      if (payment.status !== 'succeeded' && payment.status !== 'partially_refunded') {
+        validationErrors.push({
+          paymentId,
+          status: 'failed',
+          reason: `Payment in status "${payment.status}" cannot be refunded`,
+        });
+        continue;
+      }
+
+      const refundedAmount = (payment.refunds || [])
+        .filter((r) => r.status === 'succeeded' || r.status === undefined)
+        .reduce((sum, r) => sum + r.amount, 0);
+
+      const remaining = payment.amount - refundedAmount;
+      if (remaining <= 0) {
+        validationErrors.push({
+          paymentId,
+          status: 'failed',
+          reason: 'Payment is already fully refunded',
+        });
+      }
+    }
+
+    // Fail-fast and atomicity: all succeed or all fail
+    if (validationErrors.length > 0) {
+      logger.warn(
+        { adminUserId, failureCount: validationErrors.length, total: paymentIds.length },
+        'Bulk refund aborted: one or more payments failed validation'
+      );
+      return {
+        total: paymentIds.length,
+        refunded: 0,
+        failed: validationErrors.length,
+        results: paymentIds.map((id) => {
+          const failure = validationErrors.find((f) => f.paymentId === id);
+          if (failure) return failure;
+          return {
+            paymentId: id,
+            status: 'failed',
+            reason: 'Atomic bulk refund cancelled due to other failing payments',
+          };
+        }),
+      };
+    }
+
+    // All payments are valid; process them atomically in a transaction
+    const results = await this.prisma.$transaction(async (tx) => {
+      const refundResults: Array<{
+        paymentId: string;
+        status: 'refunded';
+        amount: number;
+        currency: string;
+      }> = [];
+
+      for (const payment of payments) {
+        const refundedAmount = (payment.refunds || [])
+          .filter((r) => r.status === 'succeeded' || r.status === undefined)
+          .reduce((sum, r) => sum + r.amount, 0);
+        const refundAmount = payment.amount - refundedAmount;
+
+        const refund = await tx.refund.create({
+          data: {
+            paymentId: payment.id,
+            idempotencyKey: `bulk-refund-${payment.id}-${Date.now()}`,
+            amount: refundAmount,
+            currency: payment.currency,
+            reason: reason ?? 'Bulk refund by admin',
+            status: 'succeeded',
+          },
+        });
+
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: { status: 'refunded' },
+        });
+
+        await tx.paymentEvent.create({
+          data: {
+            paymentId: payment.id,
+            type: 'refund.created',
+            actor: adminUserId,
+            data: {
+              refundId: refund.id,
+              amount: refundAmount,
+              currency: payment.currency,
+              reason: reason ?? 'Bulk refund by admin',
+              bulk: true,
+            },
+          },
+        });
+
+        refundResults.push({
+          paymentId: payment.id,
+          status: 'refunded',
+          amount: refundAmount,
+          currency: payment.currency,
+        });
+      }
+
+      await tx.auditLog.create({
+        data: {
+          userId: adminUserId,
+          action: 'payment.bulk_refund',
+          resource: 'Payment',
+          changes: {
+            paymentIds,
+            count: refundResults.length,
+            reason: reason ?? null,
+          },
+        },
+      });
+
+      return refundResults;
+    });
+
+    logger.info(
+      { adminUserId, refundedCount: results.length },
+      'Bulk payment refund completed successfully'
+    );
+
+    return {
+      total: paymentIds.length,
+      refunded: results.length,
+      failed: 0,
+      results,
+    };
+  }
+
+  /**
+   * Admin direct verification of a creator with audit logging.
+   */
+  async verifyCreatorDirect(
+    adminUserId: string,
+    creatorId: string,
+    reason: string,
+    notes?: string
+  ): Promise<{
+    creatorId: string;
+    verified: boolean;
+    verifiedAt: Date;
+    badge: { verified: boolean; type: string };
+  }> {
+    if (!(await this.isAdmin(adminUserId))) {
+      throw new UnauthorizedError('Only admins can verify creators');
+    }
+    if (!reason || reason.trim().length === 0) {
+      throw new ValidationError('Verification reason and documentation are required');
+    }
+
+    const creator = await this.prisma.creator.findUnique({
+      where: { id: creatorId },
+      select: { id: true, verified: true, username: true },
+    });
+    if (!creator) throw new NotFoundError('Creator');
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.creator.update({
+        where: { id: creatorId },
+        data: {
+          verified: true,
+          verifiedAt: now,
+        },
+      });
+
+      await tx.creatorVerificationEvent.create({
+        data: {
+          creatorId,
+          actorId: adminUserId,
+          action: 'approved',
+          reason: reason.trim(),
+          metadata: { notes: notes ?? null, directAdminVerification: true },
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          userId: adminUserId,
+          action: 'creator.verify',
+          resource: 'Creator',
+          resourceId: creatorId,
+          changes: { reason: reason.trim(), notes: notes ?? null },
+        },
+      });
+    });
+
+    logger.info({ adminUserId, creatorId }, 'Creator verified by admin');
+
+    return {
+      creatorId,
+      verified: true,
+      verifiedAt: now,
+      badge: { verified: true, type: 'verified_creator' },
+    };
+  }
 }
