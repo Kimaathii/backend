@@ -120,6 +120,7 @@ app.register(cookie, {
 
 // CSRF protection (#191) must be added before routes so it covers them all.
 registerCsrfProtection(app);
+await registerSecurityPlugins(app);
 
 // Register routes
 registerAuthRoutes(app, prisma);
@@ -281,8 +282,6 @@ process.on('SIGINT', () => {
 });
 
 const bootstrap = async (): Promise<void> => {
-  await registerSecurityPlugins(app);
-
   // Request timeout (#206): registered before any route-level hooks or
   // handlers so the deadline covers the full request lifecycle, not just
   // whatever runs after it.
