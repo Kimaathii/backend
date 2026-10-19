@@ -49,7 +49,7 @@ import { closeQueues } from './lib/queue';
 import redisPool, { closeRedisPool, startRedisHealthCheck } from './lib/redisPool';
 import { emailNotificationWorker } from './lib/workers/email-notification.worker';
 import { initTokenBlacklist, closeTokenBlacklist } from './utils/token-blacklist';
-import { parseTrustProxy } from './config/rate-limit';
+import { parseTrustProxy, MONITORING_PATHS } from './config/rate-limit';
 import { collectConfigWarnings, logConfigWarnings } from './config/warnings';
 import { logger } from './utils/logger';
 import { registerRateLimiting } from './plugins/rateLimit';
@@ -147,7 +147,12 @@ registerQueryPerformanceRoutes(app, prisma);
 registerJobRoutes(app, prisma);
 
 // Health check endpoint
-app.get('health', async (_request, _reply) => {
+//
+// Registered under MONITORING_PATHS.health so the path matches the
+// rate-limit exemption (a route registered under a different path would fall
+// back to the default class and be throttled). The path must start with a
+// slash: Fastify rejects any other prefix at boot.
+app.get(MONITORING_PATHS.health, async (_request, _reply) => {
   const dbHealth = await checkDatabaseHealth();
   const poolMetrics = getPoolMetrics();
   const cb = getCircuitBreaker();
