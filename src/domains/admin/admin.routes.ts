@@ -788,10 +788,6 @@ export const registerAdminRoutes = (app: FastifyInstance, prisma: PrismaClient):
   registerDisputeRoutes('/api/admin');
   registerDisputeRoutes('/api/v1/admin');
 
-  registerReconciliationRoutes('/api/admin');
-  registerReconciliationRoutes('/api/v1/admin');
-};
-
 type ReconciliationQuery = { from?: string; to?: string; format?: 'json' | 'csv' };
 
 function reconciliationPeriod(query: ReconciliationQuery): { from: Date; to: Date } {
@@ -830,11 +826,12 @@ const registerReconciliationRoutes = (prefix: string) => {
         const user = request.user;
         if (!user) throw new UnauthorizedError('User not found');
 
-        const range = reconciliationPeriod(request.query as ReconciliationQuery);
+        const query = request.query as ReconciliationQuery;
+        const range = reconciliationPeriod(query);
         const reconciliationService = new ReconciliationService(prisma);
         const report = await reconciliationService.getReconciliationReport(user.userId, range);
 
-        if (request.query.format === 'csv') {
+        if (query.format === 'csv') {
           const csv = await reconciliationService.toCsv(report);
           return reply
             .type('text/csv; charset=utf-8')
@@ -854,4 +851,106 @@ const registerReconciliationRoutes = (prefix: string) => {
       }
     }
   );
+};
+
+registerReconciliationRoutes('/api/admin');
+registerReconciliationRoutes('/api/v1/admin');
+
+  // Customer support tools for admins (#250)
+  const registerSupportRoutes = (prefix: string) => {
+    // GET :prefix/users/:id - View detailed account info and recent activity
+    app.get<{ Params: { id: string } }>(
+      `${prefix}/users/:id`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string' } },
+          },
+        },
+      },
+      async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const result = await adminService.getUserDetailsForSupport(
+            user.userId,
+            request.params.id,
+            { ipAddress: request.ip, requestId: request.id }
+          );
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          }
+          throw error;
+        }
+      }
+    );
+
+    // POST :prefix/users/:id/test-communication - Send test communication (email/notification)
+    app.post<{
+      Params: { id: string };
+      Body: { type: 'email' | 'notification'; subject?: string; message: string; channel?: string };
+    }>(
+      `${prefix}/users/:id/test-communication`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string' } },
+          },
+          body: {
+            type: 'object',
+            required: ['type', 'message'],
+            properties: {
+              type: { type: 'string', enum: ['email', 'notification'] },
+              subject: { type: 'string' },
+              message: { type: 'string' },
+              channel: { type: 'string' },
+            },
+          },
+        },
+      },
+      async (
+        request: FastifyRequest<{
+          Params: { id: string };
+          Body: { type: 'email' | 'notification'; subject?: string; message: string; channel?: string };
+        }>,
+        reply: FastifyReply
+      ) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const result = await adminService.sendSupportTestCommunication(
+            user.userId,
+            request.params.id,
+            request.body,
+            { ipAddress: request.ip, requestId: request.id }
+          );
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof ValidationError) {
+            return reply.code(400).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          }
+          throw error;
+        }
+      }
+    );
+  };
+
+  registerSupportRoutes('/api/v1/admin');
+  registerSupportRoutes('/api/admin');
 };
