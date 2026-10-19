@@ -1,14 +1,18 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import { AdminService, FlagWalletRequest, FreezeAccountRequest } from './admin.service';
+import { DisputeService, ResolveDisputeInput } from './dispute.service';
+import { PaymentStatus } from '../../lib/payments/types';
 import { formatSuccess, formatError } from '../../types/response';
 import { requireAdmin } from '../../middleware/rbac';
-import { AppError, UnauthorizedError } from '../../utils/errors';
+import { AppError, UnauthorizedError, ValidationError } from '../../utils/errors';
 import cache, { getStats, resetStats } from '../../lib/cache/index';
 import { CacheWarmer } from '../../lib/cache/cache-warming';
+import { ReconciliationService } from './reconciliation.service';
 
 export const registerAdminRoutes = (app: FastifyInstance, prisma: PrismaClient): void => {
   const adminService = new AdminService(prisma);
+  const disputeService = new DisputeService(prisma);
 
   app.post<{ Body: { creatorIds: string[] } }>(
     '/api/v1/admin/batches/creators/verify',
@@ -20,6 +24,167 @@ export const registerAdminRoutes = (app: FastifyInstance, prisma: PrismaClient):
           request.body.creatorIds
         );
         return reply.code(202).send(formatSuccess(result));
+      } catch (error) {
+        if (error instanceof AppError)
+          return reply.code(error.statusCode).send(formatError(error.message, error.code));
+        throw error;
+      }
+    }
+  );
+
+  // POST /api/admin/payments/bulk-refund - Bulk refund payments
+  const bulkRefundHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const user = request.user;
+      if (!user) throw new UnauthorizedError('User not authenticated');
+      const body = request.body as { paymentIds: string[]; reason?: string };
+      const result = await adminService.bulkRefundPayments(
+        user.userId,
+        body.paymentIds,
+        body.reason
+      );
+      return reply.code(200).send(formatSuccess(result));
+    } catch (error) {
+      if (error instanceof AppError) {
+        return reply.code(error.statusCode).send(formatError(error.message, error.code));
+      }
+      throw error;
+    }
+  };
+
+  app.post<{ Body: { paymentIds: string[]; reason?: string } }>(
+    '/api/v1/admin/payments/bulk-refund',
+    { preHandler: requireAdmin },
+    bulkRefundHandler
+  );
+
+  app.post<{ Body: { paymentIds: string[]; reason?: string } }>(
+    '/api/admin/payments/bulk-refund',
+    { preHandler: requireAdmin },
+    bulkRefundHandler
+  );
+
+  // POST /api/admin/creators/:creatorId/verify - Admin verify creator with documentation and badge
+  const verifyCreatorDirectHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const user = request.user;
+      if (!user) throw new UnauthorizedError('User not authenticated');
+      const { creatorId } = request.params as { creatorId: string };
+      const body = (request.body as { reason: string; notes?: string }) ?? {};
+      const result = await adminService.verifyCreatorDirect(
+        user.userId,
+        creatorId,
+        body.reason,
+        body.notes
+      );
+      return reply.code(200).send(formatSuccess(result));
+    } catch (error) {
+      if (error instanceof AppError) {
+        return reply.code(error.statusCode).send(formatError(error.message, error.code));
+      }
+      throw error;
+    }
+  };
+
+  app.post<{ Params: { creatorId: string }; Body: { reason: string; notes?: string } }>(
+    '/api/v1/admin/creators/:creatorId/verify',
+    { preHandler: requireAdmin },
+    verifyCreatorDirectHandler
+  );
+
+  app.post<{ Params: { creatorId: string }; Body: { reason: string; notes?: string } }>(
+    '/api/admin/creators/:creatorId/verify',
+    { preHandler: requireAdmin },
+    verifyCreatorDirectHandler
+  );
+
+  // POST /api/admin/users/bulk-import - Bulk import users from CSV
+  app.post<{ Body: { csv: string } }>(
+    '/api/v1/admin/users/bulk-import',
+    {
+      preHandler: requireAdmin,
+      schema: {
+        body: {
+          type: 'object',
+          required: ['csv'],
+          properties: {
+            csv: { type: 'string', description: 'CSV content with user data (email,password,name,role)' },
+          },
+        },
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  total: { type: 'number' },
+                  created: { type: 'number' },
+                  failed: { type: 'number' },
+                  results: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        row: { type: 'number' },
+                        email: { type: 'string' },
+                        status: { type: 'string' },
+                        userId: { type: 'string' },
+                        errors: { type: 'array', items: { type: 'string' } },
+                      },
+                    },
+                  },
+                },
+              },
+              timestamp: { type: 'string' },
+            },
+          },
+          400: { type: 'null', description: 'Validation error' },
+          401: { type: 'null', description: 'Unauthorized' },
+          403: { type: 'null', description: 'Admin only' },
+        },
+      },
+    },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const user = request.user;
+        if (!user) throw new Error('User not found');
+
+        const { csv } = request.body as { csv: string };
+        const result = await adminService.bulkImportUsers(user.userId, csv);
+        return reply.code(200).send(formatSuccess(result));
+      } catch (error) {
+        if (error instanceof AppError)
+          return reply.code(error.statusCode).send(formatError(error.message, error.code));
+        throw error;
+      }
+    }
+  );
+
+  // POST /api/admin/users/bulk-import - Bulk import users from CSV (alias prefix)
+  app.post<{ Body: { csv: string } }>(
+    '/api/admin/users/bulk-import',
+    {
+      preHandler: requireAdmin,
+      schema: {
+        body: {
+          type: 'object',
+          required: ['csv'],
+          properties: {
+            csv: { type: 'string', description: 'CSV content with user data (email,password,name,role)' },
+          },
+        },
+      },
+    },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const user = request.user;
+        if (!user) throw new Error('User not found');
+
+        const { csv } = request.body as { csv: string };
+        const result = await adminService.bulkImportUsers(user.userId, csv);
+        return reply.code(200).send(formatSuccess(result));
       } catch (error) {
         if (error instanceof AppError)
           return reply.code(error.statusCode).send(formatError(error.message, error.code));
@@ -439,4 +604,353 @@ export const registerAdminRoutes = (app: FastifyInstance, prisma: PrismaClient):
       }
     }
   );
+
+  // Helper to register dispute routes on both /api/admin and /api/v1/admin
+  const registerDisputeRoutes = (prefix: string) => {
+    // POST :prefix/payments/:id/dispute - Mark payment as disputed
+    app.post<{ Params: { id: string }; Body: { reason: string; notes?: string } }>(
+      `${prefix}/payments/:id/dispute`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string', description: 'Payment ID' } },
+          },
+          body: {
+            type: 'object',
+            required: ['reason'],
+            properties: {
+              reason: { type: 'string', description: 'Reason for dispute' },
+              notes: { type: 'string', description: 'Optional internal notes' },
+            },
+          },
+        },
+      },
+      async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const { id } = request.params as { id: string };
+          const body = request.body as { reason: string; notes?: string };
+          const result = await disputeService.markDisputed(id, user.userId, body);
+          return reply.code(200).send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          } else {
+            throw error;
+          }
+        }
+      }
+    );
+
+    // POST :prefix/payments/:id/resolve - Resolve payment dispute (approve, reject, refund)
+    app.post<{
+      Params: { id: string };
+      Body: {
+        action: 'approve' | 'reject' | 'refund';
+        reason: string;
+        notes?: string;
+        amount?: number;
+        targetStatus?: PaymentStatus;
+      };
+    }>(
+      `${prefix}/payments/:id/resolve`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string', description: 'Payment ID' } },
+          },
+          body: {
+            type: 'object',
+            required: ['action', 'reason'],
+            properties: {
+              action: { type: 'string', enum: ['approve', 'reject', 'refund'] },
+              reason: { type: 'string', description: 'Resolution reason' },
+              notes: { type: 'string', description: 'Optional internal notes' },
+              amount: { type: 'number', description: 'Optional refund amount' },
+              targetStatus: { type: 'string', description: 'Optional explicit target status' },
+            },
+          },
+        },
+      },
+      async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const { id } = request.params as { id: string };
+          const body = request.body as ResolveDisputeInput;
+          const result = await disputeService.resolveDispute(id, user.userId, body);
+          return reply.code(200).send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          } else {
+            throw error;
+          }
+        }
+      }
+    );
+
+    // GET :prefix/payments - List payments with status filter (e.g. status='disputed')
+    app.get<{
+      Querystring: {
+        status?: string;
+        page?: string;
+        pageSize?: string;
+        limit?: string;
+        userId?: string;
+        creatorId?: string;
+      };
+    }>(
+      `${prefix}/payments`,
+      {
+        preHandler: requireAdmin,
+      },
+      async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const query = request.query as {
+            status?: string;
+            page?: string;
+            pageSize?: string;
+            limit?: string;
+            userId?: string;
+            creatorId?: string;
+          };
+          const page = query?.page ? parseInt(query.page, 10) : 1;
+          const pageSize = query?.pageSize
+            ? parseInt(query.pageSize, 10)
+            : query?.limit
+              ? parseInt(query.limit, 10)
+              : 20;
+
+          const result = await disputeService.listPayments({
+            status: query?.status,
+            page,
+            pageSize,
+            userId: query?.userId,
+            creatorId: query?.creatorId,
+          });
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          } else {
+            throw error;
+          }
+        }
+      }
+    );
+
+    // GET :prefix/payments/:id - Get single payment detail
+    app.get<{ Params: { id: string } }>(
+      `${prefix}/payments/:id`,
+      {
+        preHandler: requireAdmin,
+      },
+      async (request: FastifyRequest, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const { id } = request.params as { id: string };
+          const result = await disputeService.getPayment(id);
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          } else {
+            throw error;
+          }
+        }
+      }
+    );
+  };
+
+  registerDisputeRoutes('/api/admin');
+  registerDisputeRoutes('/api/v1/admin');
+
+type ReconciliationQuery = { from?: string; to?: string; format?: 'json' | 'csv' };
+
+function reconciliationPeriod(query: ReconciliationQuery): { from: Date; to: Date } {
+  const to = query.to ? new Date(query.to) : new Date();
+  const from = query.from ? new Date(query.from) : new Date(to.getTime() - 30 * 86_400_000);
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) {
+    throw new ValidationError('from and to must be valid dates with from before to');
+  }
+  return { from, to };
+}
+
+const registerReconciliationRoutes = (prefix: string) => {
+  app.get<{ Querystring: ReconciliationQuery }>(
+    `${prefix}/payments/reconciliation`,
+    {
+      preHandler: requireAdmin,
+      schema: {
+        querystring: {
+          type: 'object',
+          properties: {
+            from: { type: 'string', description: 'Start of period (ISO-8601)' },
+            to: { type: 'string', description: 'End of period (ISO-8601)' },
+            format: { type: 'string', enum: ['json', 'csv'], description: 'Response format' },
+          },
+        },
+        response: {
+          200: { type: 'null', description: 'Reconciliation report' },
+          400: { type: 'null', description: 'Invalid period' },
+          401: { type: 'null', description: 'Unauthorized' },
+          403: { type: 'null', description: 'Admin only' },
+        },
+      },
+    },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const user = request.user;
+        if (!user) throw new UnauthorizedError('User not found');
+
+        const query = request.query as ReconciliationQuery;
+        const range = reconciliationPeriod(query);
+        const reconciliationService = new ReconciliationService(prisma);
+        const report = await reconciliationService.getReconciliationReport(user.userId, range);
+
+        if (query.format === 'csv') {
+          const csv = await reconciliationService.toCsv(report);
+          return reply
+            .type('text/csv; charset=utf-8')
+            .header('Content-Disposition', 'attachment; filename="reconciliation-report.csv"')
+            .send(csv);
+        }
+        return reply.send(formatSuccess(report));
+      } catch (error) {
+        if (error instanceof UnauthorizedError) {
+          return reply.code(403).send(formatError(error.message, error.code));
+        } else if (error instanceof ValidationError) {
+          return reply.code(400).send(formatError(error.message, error.code));
+        } else if (error instanceof AppError) {
+          return reply.code(error.statusCode).send(formatError(error.message, error.code));
+        }
+        throw error;
+      }
+    }
+  );
+};
+
+registerReconciliationRoutes('/api/admin');
+registerReconciliationRoutes('/api/v1/admin');
+
+  // Customer support tools for admins (#250)
+  const registerSupportRoutes = (prefix: string) => {
+    // GET :prefix/users/:id - View detailed account info and recent activity
+    app.get<{ Params: { id: string } }>(
+      `${prefix}/users/:id`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string' } },
+          },
+        },
+      },
+      async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const result = await adminService.getUserDetailsForSupport(
+            user.userId,
+            request.params.id,
+            { ipAddress: request.ip, requestId: request.id }
+          );
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          }
+          throw error;
+        }
+      }
+    );
+
+    // POST :prefix/users/:id/test-communication - Send test communication (email/notification)
+    app.post<{
+      Params: { id: string };
+      Body: { type: 'email' | 'notification'; subject?: string; message: string; channel?: string };
+    }>(
+      `${prefix}/users/:id/test-communication`,
+      {
+        preHandler: requireAdmin,
+        schema: {
+          params: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string' } },
+          },
+          body: {
+            type: 'object',
+            required: ['type', 'message'],
+            properties: {
+              type: { type: 'string', enum: ['email', 'notification'] },
+              subject: { type: 'string' },
+              message: { type: 'string' },
+              channel: { type: 'string' },
+            },
+          },
+        },
+      },
+      async (
+        request: FastifyRequest<{
+          Params: { id: string };
+          Body: { type: 'email' | 'notification'; subject?: string; message: string; channel?: string };
+        }>,
+        reply: FastifyReply
+      ) => {
+        try {
+          const user = request.user;
+          if (!user) throw new UnauthorizedError('User not found');
+
+          const result = await adminService.sendSupportTestCommunication(
+            user.userId,
+            request.params.id,
+            request.body,
+            { ipAddress: request.ip, requestId: request.id }
+          );
+          return reply.send(formatSuccess(result));
+        } catch (error) {
+          if (error instanceof UnauthorizedError) {
+            return reply.code(403).send(formatError(error.message, error.code));
+          } else if (error instanceof ValidationError) {
+            return reply.code(400).send(formatError(error.message, error.code));
+          } else if (error instanceof AppError) {
+            return reply.code(error.statusCode).send(formatError(error.message, error.code));
+          }
+          throw error;
+        }
+      }
+    );
+  };
+
+  registerSupportRoutes('/api/v1/admin');
+  registerSupportRoutes('/api/admin');
 };

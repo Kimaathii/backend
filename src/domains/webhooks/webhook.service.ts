@@ -3,7 +3,7 @@ import { BaseService } from '../../services/base.service';
 import { ValidationError, NotFoundError } from '../../utils/errors';
 import { webhookDispatchQueue } from '../../lib/queue';
 import { logger } from '../../utils/logger';
-import { getRequestId, withRequestIdPayload } from '../../lib/requestContext';
+import { getRequestId, withJobTracePayload, withRequestIdPayload } from '../../lib/requestContext';
 import crypto from 'crypto';
 import { isWebhookEventType, WebhookEventEnvelope, WebhookEventType } from './webhook.events';
 import { AuditService } from '../../services/audit.service';
@@ -230,13 +230,12 @@ export class WebhookService extends BaseService {
         try {
           await webhookDispatchQueue.add(
             'dispatch-event',
-            {
+            withJobTracePayload({
               webhookId: webhook.id,
               eventId: delivery.id,
               eventType,
-              requestId: getRequestId(),
               payload: withRequestIdPayload(event),
-            },
+            }),
             {
               attempts: 5,
               backoff: { type: 'exponential', delay: 2000 },

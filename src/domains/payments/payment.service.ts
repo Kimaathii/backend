@@ -1,4 +1,4 @@
-import { PrismaClient, Tip } from '@prisma/client';
+import { Prisma, PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import {
   CreateTipRequest,
@@ -8,6 +8,7 @@ import {
   BuildTransactionResponse,
   SubmitTransactionResponse,
 } from './payment.types';
+import { buildMultiCurrencyDetails } from './currency.utils';
 import {
   ValidationError,
   NotFoundError,
@@ -16,22 +17,25 @@ import {
   InvalidCurrencyError,
   PaymentDeclinedError,
   PaymentNotFoundError,
-  PaymentRequiredError,
   ServiceUnavailableError,
 } from '../../utils/errors';
 import { buildPaymentTransaction, submitSignedTransaction } from '../../lib/stellar/transactions';
-import { getWalletBalance } from '../../lib/stellar/wallet';
 import { logger } from '../../utils/logger';
+import { transactionRetryCounter } from '../../lib/metrics';
 import { sanitizePageSize, sanitizePageNumber, parseSortParameters } from '../../utils/pagination';
 import { paginateWithCursor } from '../../db/pagination';
 import { WebhookService } from '../webhooks/webhook.service';
 import { buildTipMemo, validateMemo, validatePaymentAmount } from '../../lib/stellar/validation';
+import { checkMinimumTipAmount, type TipCurrency } from '../../config/payment-limits';
 import { config } from '../../config/env';
 import { MAX_MEDIA_PER_TIP, type MediaView } from '../media/media.types';
 import { buildCdnUrl } from '../media/media.storage';
 import { TIP_VISIBLE_STATE } from '../moderation/moderation.types';
 import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
+import { formatInTimezone } from '../../utils/timezone';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
+import { withJobTracePayload } from '../../lib/requestContext';
+import { validateWhitelistedAsset } from './payment.schemas';
 /**
 
  * Columns required to build a TipResponse.
@@ -113,13 +117,25 @@ export class PaymentService extends BaseService {
    * - Creator exists and is public and verified
    * - Sender has a verified wallet
    */
-  async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse> {
+  async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse & { jobId?: string }> {
     return this.executeWithLogging('payment.createTip', async () => {
       // Validate amount at the service boundary as well, so callers that bypass
       // the route layer (jobs, internal tooling) cannot create bad records.
       const amountCheck = validatePaymentAmount(data.amount);
       if (!amountCheck.valid) {
         throw new ValidationError(amountCheck.reason || 'Amount must be greater than 0');
+      }
+
+      // #218 — Reject 0-value/dust tips below the per-currency minimum. Repeats
+      // the schema-level check so a caller that bypasses the route layer cannot
+      // create a sub-minimum tip either. The minimum and currency are included
+      // in the error so the caller knows exactly how much more is required.
+      const minimumCheck = checkMinimumTipAmount(data.amount, data.currency as TipCurrency | undefined);
+      if (!minimumCheck.valid) {
+        throw new ValidationError(
+          `Amount must be at least ${minimumCheck.minimum} ${minimumCheck.currency} (minimum tip amount)`,
+          { minimumAmount: minimumCheck.minimum, currency: minimumCheck.currency }
+        );
       }
 
       // Verify creator exists, is public, and is verified
@@ -138,6 +154,10 @@ export class PaymentService extends BaseService {
 
       if (!creator.verified) {
         throw new ValidationError('Creator account must be verified to receive tips');
+      }
+
+      if (data.assetCode || data.assetIssuer) {
+        await validateWhitelistedAsset(data.assetCode || 'USDC', data.assetIssuer, this.prisma);
       }
 
       const requestedAsset = data.assetId
@@ -226,40 +246,17 @@ export class PaymentService extends BaseService {
         }
       }
 
-      // #175 — Check on-chain balance before creating any DB record
+      // #221 — Tip creation is asynchronous: the on-chain balance check (a
+      // Stellar Horizon RPC call that can be slow or time out under network
+      // congestion) is no longer made on this request path. The tip is
+      // created immediately in PENDING state below, and a queued job
+      // (`balanceVerificationQueue`, handled by
+      // `lib/workers/balance-verification.worker.ts`) verifies the balance
+      // afterwards, transitioning the tip to FAILED if funds are insufficient
+      // or the check cannot be completed. `assetCode` is still resolved here
+      // (not a network call) so it can be persisted on the tip and forwarded
+      // to the job.
       const assetCode = requestedAsset?.code ?? 'USDC';
-      let walletBalances: { lumens: string; usdc?: string };
-      try {
-        walletBalances = await getWalletBalance(wallet.publicKey);
-      } catch (err) {
-        logger.error(
-          { userId, walletPublicKey: wallet.publicKey, failureReason: 'balance_check_failed' },
-          'Tip blocked: failed to fetch on-chain wallet balance'
-        );
-        throw new ServiceUnavailableError('Unable to verify wallet balance at this time');
-      }
-
-      const rawBalance =
-        assetCode === 'USDC' ? (walletBalances.usdc ?? '0') : walletBalances.lumens;
-      const currentBalance = parseFloat(rawBalance);
-      if (!Number.isFinite(currentBalance) || currentBalance < data.amount) {
-        logger.warn(
-          {
-            userId,
-            walletPublicKey: wallet.publicKey,
-            requiredAmount: data.amount,
-            currentBalance,
-            currency: assetCode,
-            failureReason: 'insufficient_balance',
-          },
-          'Tip blocked: insufficient on-chain balance'
-        );
-        throw new PaymentRequiredError('Insufficient funds to complete the payment', {
-          requiredAmount: data.amount,
-          currentBalance,
-          currency: assetCode,
-        });
-      }
 
       // Validate requested media (#64) before creating the tip: every id must be
       // media this user uploaded, finished scanning, and has not already attached.
@@ -334,7 +331,43 @@ export class PaymentService extends BaseService {
         logger.info(`Tip ${tip.id} attached ${attachableMedia.length} media item(s)`);
       }
 
-      return this.formatTipResponse(tip);
+      // #221 — Enqueue the balance verification job now that the tip exists.
+      // Imported lazily, same reasoning as `checkTransactionConfirmation`
+      // below: importing the queue module opens a Redis connection as a side
+      // effect, which unit tests that import the service must not trigger.
+      let jobId: string | undefined;
+      try {
+        const { balanceVerificationQueue } = await import('../../lib/queue');
+        const job = await balanceVerificationQueue.add(
+          'verify-balance',
+          withJobTracePayload(
+            {
+              tipId: tip.id,
+              walletPublicKey: wallet.publicKey,
+              assetCode,
+              requiredAmount: tip.amount,
+            },
+            { userId }
+          ),
+          {
+            attempts: 5,
+            backoff: { type: 'exponential', delay: 2000 },
+          }
+        );
+        jobId = String(job.id);
+      } catch (error) {
+        // The tip already exists and is authoritative; a failure to enqueue
+        // verification is logged, not surfaced, so a Redis hiccup never turns
+        // into a failed tip creation request (the exact failure mode #221
+        // exists to remove). The tip is left PENDING; an operational sweep or
+        // manual retry can re-enqueue verification for it later.
+        logger.error(
+          { tipId: tip.id, error },
+          'Failed to enqueue balance verification job; tip remains PENDING unverified'
+        );
+      }
+
+      return { ...this.formatTipResponse(tip), jobId };
     });
   }
 
@@ -467,7 +500,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -522,8 +555,8 @@ export class PaymentService extends BaseService {
 
       return {
         ...result,
-        items: result.items.map((tip) => this.formatTipResponse(tip)),
-        data: result.data.map((tip) => this.formatTipResponse(tip)),
+        items: result.items.map((tip) => this.formatTipResponse(tip, params.timezone)),
+        data: result.data.map((tip) => this.formatTipResponse(tip, params.timezone)),
         filters: describeTipFilters(params),
       };
     });
@@ -582,7 +615,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -629,8 +662,8 @@ export class PaymentService extends BaseService {
 
       return {
         ...result,
-        items: result.items.map((tip) => this.formatTipResponse(tip)),
-        data: result.data.map((tip) => this.formatTipResponse(tip)),
+        items: result.items.map((tip) => this.formatTipResponse(tip, params.timezone)),
+        data: result.data.map((tip) => this.formatTipResponse(tip, params.timezone)),
         filters: describeTipFilters(params),
       };
     });
@@ -693,7 +726,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -936,7 +969,7 @@ export class PaymentService extends BaseService {
             }
 
             return this.formatTipResponse({ ...tip, status: data.status });
-          });
+          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
           break; // Exit retry loop on success
         } catch (error: unknown) {
           attempt++;
@@ -945,6 +978,10 @@ export class PaymentService extends BaseService {
             error instanceof OptimisticLockError || code === 'P2028' || code === 'P2034';
 
           if (retryable && attempt < maxRetries) {
+            transactionRetryCounter.inc({
+              operation: 'payment.updateTipStatus',
+              reason: error instanceof OptimisticLockError ? 'optimistic_lock' : code === 'P2034' ? 'serialization_failure' : 'deadlock',
+            });
             logger.warn(
               { tipId, attempt, maxRetries },
               'Concurrent tip update detected; retrying with fresh state'
@@ -1037,6 +1074,9 @@ export class PaymentService extends BaseService {
           field: 'memo',
         });
       }
+
+      // Validate asset code and issuer against configured whitelisted assets (#185)
+      await validateWhitelistedAsset(assetCode || 'USDC', assetIssuer, this.prisma);
 
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
@@ -1212,10 +1252,14 @@ export class PaymentService extends BaseService {
       const { stellarConfirmationQueue } = await import('../../lib/queue');
       await stellarConfirmationQueue.add(
         'confirm-transaction',
-        {
-          transactionId: tipId,
-          transactionHash: tip.transactionHash,
-        },
+        withJobTracePayload(
+          {
+            transactionId: tipId,
+            tipId,
+            transactionHash: tip.transactionHash,
+          },
+          { userId: tip.fromUserId }
+        ),
         {
           attempts: 60,
           backoff: { type: 'exponential', delay: 1000 },
@@ -1230,32 +1274,161 @@ export class PaymentService extends BaseService {
   }
 
   /**
+   * Confirm a submitted transaction by polling the Stellar network and
+   * transitioning the tip to its terminal state.
+   *
+   * This is the synchronous counterpart to `checkTransactionConfirmation`
+   * (which only enqueues an async job). It is invoked by the confirmation
+   * worker and by integration tests that exercise the full confirmation
+   * workflow without a live Redis queue.
+   *
+   * Retry strategy (mirrors the queue's `attempts`/`backoff` config):
+   *  - The worker polls up to `maxAttempts` times with exponential backoff.
+   *  - A transaction that is still pending after the retry limit is left in
+   *    PENDING (the worker gives up; a later sweep may re-enqueue it).
+   *  - Transient network errors during polling are retried; a persistent
+   *    error surfaces as `ServiceUnavailableError` so the job can be retried.
+   *  - Confirmation is idempotent: re-running it against an already-completed
+   *    tip is a no-op (no duplicate earnings, no duplicate webhook).
+   */
+  async confirmTransaction(
+    tipId: string,
+    options: {
+      maxAttempts?: number;
+      baseDelayMs?: number;
+      poll?: (transactionHash: string) => Promise<'success' | 'pending' | 'failed'>;
+    } = {}
+  ): Promise<TipResponse> {
+    return this.executeWithLogging('payment.confirmTransaction', async () => {
+      const maxAttempts = options.maxAttempts ?? 3;
+      const baseDelayMs = options.baseDelayMs ?? 10;
+
+      const tip = await this.prisma.tip.findUnique({
+        where: { id: tipId },
+        select: { id: true, status: true, transactionHash: true },
+      });
+
+      if (!tip) {
+        throw new NotFoundError('Tip');
+      }
+
+      if (!tip.transactionHash) {
+        throw new ValidationError('No transaction hash found for this tip');
+      }
+
+      // Idempotency: a tip that already reached a terminal state is not
+      // re-confirmed. Returning the current record keeps retries safe.
+      if (tip.status === TipStatus.COMPLETED || tip.status === TipStatus.FAILED || tip.status === TipStatus.CANCELLED) {
+        logger.info(
+          { tipId, status: tip.status },
+          'Confirmation skipped: tip already in terminal state'
+        );
+        return this.getTip(tipId);
+      }
+
+      const poll =
+        options.poll ??
+        (async (transactionHash: string) => {
+          const { getTransactionStatus } = await import('../../lib/stellar/transactions');
+          return getTransactionStatus(transactionHash);
+        });
+
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let outcome: 'success' | 'pending' | 'failed';
+        try {
+          outcome = await poll(tip.transactionHash);
+        } catch (error) {
+          lastError = error;
+          logger.warn(
+            { tipId, attempt, maxAttempts, cause: (error as Error).message },
+            'Stellar confirmation poll failed; retrying'
+          );
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+            );
+            continue;
+          }
+          throw new ServiceUnavailableError(
+            'Unable to confirm transaction on the Stellar network',
+            { tipId, attempts: attempt }
+          );
+        }
+
+        if (outcome === 'success') {
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+        }
+
+        if (outcome === 'failed') {
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+        }
+
+        // Still pending: back off and poll again.
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+          );
+        }
+      }
+
+      // Pending beyond the retry limit: leave the tip PENDING so a later sweep
+      // can re-enqueue it. Do not mark it FAILED — the transaction may still
+      // land on-chain.
+      logger.warn(
+        { tipId, attempts: maxAttempts, cause: (lastError as Error | undefined)?.message },
+        'Transaction still pending after retry limit; leaving tip in PENDING'
+      );
+      return this.getTip(tipId);
+    });
+  }
+
+  /**
    * Format database tip record to response DTO
    */
-  private formatTipResponse(tip: {
-    id: string;
-    fromUserId: string;
-    creatorId: string;
-    amount: number;
-    message: string | null;
-    status: string;
-    transactionHash?: string | null;
-    createdAt: Date;
-    updatedAt: Date;
-  }): TipResponse {
+  private formatTipResponse(
+    tip: {
+      id: string;
+      fromUserId: string;
+      creatorId: string;
+      amount: number;
+      message: string | null;
+      status: string;
+      transactionHash?: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+      media?: any[];
+      assetCode?: string | null;
+      assetIssuer?: string | null;
+      assetDecimals?: number | null;
+    },
+    timezone?: string
+  ): TipResponse {
+    const currency = tip.assetCode ?? 'USDC';
+    const currencyDetails = buildMultiCurrencyDetails(tip.amount, currency);
+
     return {
       id: tip.id,
       fromUserId: tip.fromUserId,
       creatorId: tip.creatorId,
       amount: tip.amount,
+      currency: currencyDetails.currency,
+      currencyCode: currencyDetails.currencyCode,
+      currencySymbol: currencyDetails.currencySymbol,
+      formattedAmount: currencyDetails.formattedAmount,
+      exchangeRate: currencyDetails.exchangeRate,
+      exchangeRateInfo: currencyDetails.exchangeRateInfo,
       message: tip.message,
       status: tip.status as TipResponse['status'],
       transactionHash: tip.transactionHash || null,
       media: Array.isArray(tip.media)
         ? tip.media.map((row: any) => this.formatAttachedMedia(row))
         : [],
-      createdAt: tip.createdAt.toISOString(),
-      updatedAt: tip.updatedAt.toISOString(),
+      // Formatted in the caller's requested timezone when listing/filtering
+      // by date range (issue #216); every other call site omits `timezone`
+      // and gets the previous plain-UTC ISO string, unchanged.
+      createdAt: formatInTimezone(tip.createdAt, timezone),
+      updatedAt: formatInTimezone(tip.updatedAt, timezone),
       assetCode: tip.assetCode ?? 'USDC',
       assetIssuer: tip.assetIssuer ?? null,
       assetDecimals: tip.assetDecimals ?? 7,

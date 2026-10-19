@@ -19,7 +19,46 @@ vi.mock('../../domains/admin/admin.service', () => ({
     freezeAccount: vi.fn().mockResolvedValue({ id: 'freeze-1' }),
     unfreezeAccount: vi.fn().mockResolvedValue(undefined),
     getModerationQueue: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+    getUserDetailsForSupport: vi.fn().mockResolvedValue({
+      user: { id: 'u-target', email: 'target@example.com' },
+      recentActivity: { payments: [], logins: [], errors: [] },
+    }),
+    sendSupportTestCommunication: vi.fn().mockResolvedValue({
+      success: true,
+      targetUserId: 'u-target',
+      type: 'email',
+      deliveredAt: new Date().toISOString(),
+    }),
   })),
+}));
+
+// ── dispute service mock ──────────────────────────────────────────────────────
+const disputeServiceMocks = vi.hoisted(() => ({
+  markDisputed: vi.fn().mockResolvedValue({
+    payment: { id: 'p-1', status: 'disputed' },
+    dispute: { status: 'open', reason: 'Fraudulent double charge' },
+  }),
+  resolveDispute: vi.fn().mockResolvedValue({
+    payment: { id: 'p-1', status: 'refunded' },
+    dispute: { status: 'resolved', resolution: 'refund' },
+    refund: { id: 'ref-1', amount: 50 },
+  }),
+  listPayments: vi.fn().mockResolvedValue({
+    payments: [{ id: 'p-1', status: 'disputed', amount: 50 }],
+    total: 1,
+    page: 1,
+    pageSize: 20,
+    totalPages: 1,
+  }),
+  getPayment: vi.fn().mockResolvedValue({
+    id: 'p-1',
+    status: 'disputed',
+    amount: 50,
+  }),
+}));
+
+vi.mock('../../domains/admin/dispute.service', () => ({
+  DisputeService: vi.fn().mockImplementation(() => disputeServiceMocks),
 }));
 
 // ── cache mock ────────────────────────────────────────────────────────────────
@@ -145,6 +184,246 @@ describe('admin routes — requireAdmin RBAC enforcement (#35)', () => {
     it('rejects fan users with 403', async () => {
       setUser('fan');
       const res = await app.inject({ method: 'GET', url: '/api/v1/admin/cache/stats' });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  // ── Payment dispute workflow (#189) ─────────────────────────────────────────
+
+  describe('POST /api/admin/payments/:id/dispute', () => {
+    it('allows admin users to mark a payment as disputed', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/dispute',
+        payload: { reason: 'Double charge confirmed by user' },
+      });
+      expect(res.statusCode).toBe(200);
+      const json = JSON.parse(res.payload);
+      expect(json.success).toBe(true);
+      expect(disputeServiceMocks.markDisputed).toHaveBeenCalledWith(
+        'pay-123',
+        'u-1',
+        expect.objectContaining({ reason: 'Double charge confirmed by user' })
+      );
+    });
+
+    it('allows versioned path /api/v1/admin/payments/:id/dispute', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/admin/payments/pay-123/dispute',
+        payload: { reason: 'Double charge' },
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/dispute',
+        payload: { reason: 'Unauthorized attempt' },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+
+    it('rejects creator users with 403', async () => {
+      setUser('creator');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/dispute',
+        payload: { reason: 'Unauthorized attempt' },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe('POST /api/admin/payments/:id/resolve', () => {
+    it('allows admin users to resolve a dispute with refund action', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/resolve',
+        payload: { action: 'refund', reason: 'Refund approved by compliance' },
+      });
+      expect(res.statusCode).toBe(200);
+      const json = JSON.parse(res.payload);
+      expect(json.success).toBe(true);
+      expect(disputeServiceMocks.resolveDispute).toHaveBeenCalledWith(
+        'pay-123',
+        'u-1',
+        expect.objectContaining({ action: 'refund', reason: 'Refund approved by compliance' })
+      );
+    });
+
+    it('allows admin users to resolve a dispute with approve action', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/admin/payments/pay-123/resolve',
+        payload: { action: 'approve', reason: 'Stellar transaction confirmed on explorer' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(disputeServiceMocks.resolveDispute).toHaveBeenCalledWith(
+        'pay-123',
+        'u-1',
+        expect.objectContaining({ action: 'approve' })
+      );
+    });
+
+    it('allows admin users to resolve a dispute with reject action', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/resolve',
+        payload: { action: 'reject', reason: 'False claim, user consumed media' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(disputeServiceMocks.resolveDispute).toHaveBeenCalledWith(
+        'pay-123',
+        'u-1',
+        expect.objectContaining({ action: 'reject' })
+      );
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/payments/pay-123/resolve',
+        payload: { action: 'refund', reason: 'Unauthorized' },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe('GET /api/admin/payments (disputed payments listing)', () => {
+    it('allows admin users to list payments filtered by status=disputed', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/admin/payments?status=disputed&page=1&pageSize=10',
+      });
+      expect(res.statusCode).toBe(200);
+      const json = JSON.parse(res.payload);
+      expect(json.success).toBe(true);
+      expect(disputeServiceMocks.listPayments).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'disputed', page: 1, pageSize: 10 })
+      );
+    });
+
+    it('allows versioned path /api/v1/admin/payments', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/admin/payments?status=disputed',
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/admin/payments?status=disputed',
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe('GET /api/admin/payments/:id', () => {
+    it('allows admin users to get payment details', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/admin/payments/pay-123',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(disputeServiceMocks.getPayment).toHaveBeenCalledWith('pay-123');
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/admin/payments/pay-123',
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe('GET /api/admin/users/:id (#250)', () => {
+    it('allows admin users to view detailed account info and recent activity', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/admin/users/usr-target-1',
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.user.id).toBe('u-target');
+      expect(body.data.recentActivity).toBeDefined();
+
+      // Test alias prefix
+      const aliasRes = await app.inject({
+        method: 'GET',
+        url: '/api/admin/users/usr-target-1',
+      });
+      expect(aliasRes.statusCode).toBe(200);
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/admin/users/usr-target-1',
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe('POST /api/admin/users/:id/test-communication (#250)', () => {
+    it('allows admin users to send test communications', async () => {
+      setUser('admin');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/admin/users/usr-target-1/test-communication',
+        payload: {
+          type: 'email',
+          subject: 'Support test',
+          message: 'This is a test notification from admin support',
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.success).toBe(true);
+      expect(body.data.type).toBe('email');
+
+      // Test alias prefix
+      const aliasRes = await app.inject({
+        method: 'POST',
+        url: '/api/admin/users/usr-target-1/test-communication',
+        payload: {
+          type: 'notification',
+          message: 'In-app test notification',
+        },
+      });
+      expect(aliasRes.statusCode).toBe(200);
+    });
+
+    it('rejects fan users with 403', async () => {
+      setUser('fan');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/users/usr-target-1/test-communication',
+        payload: {
+          type: 'email',
+          message: 'Unauthorized test',
+        },
+      });
       expect(res.statusCode).toBe(403);
     });
   });

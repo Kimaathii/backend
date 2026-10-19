@@ -1,7 +1,7 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import { CreateCreatorRequest, UpdateCreatorRequest } from './creator.types';
-import { ValidationError } from '../../utils/errors';
+import { ConflictError, ValidationError } from '../../utils/errors';
 import { getOrFetch, update, createCacheKey, CacheType } from '../../lib/cache/cache-aside';
 import { invalidateCaches, creatorCacheKeys } from '../../lib/cache/invalidation';
 import {
@@ -43,6 +43,17 @@ export class CreatorService extends BaseService {
     super();
   }
 
+  private formatCreatorProfile(creator: any): any {
+    if (!creator) return creator;
+    const isVerified = Boolean(creator.verified);
+    return {
+      ...creator,
+      verified: isVerified,
+      verificationBadge: isVerified,
+      badge: isVerified ? { verified: true, type: 'verified' } : null,
+    };
+  }
+
   async createCreator(
     userId: string,
     data: CreateCreatorRequest
@@ -54,7 +65,7 @@ export class CreatorService extends BaseService {
       });
 
       if (existingCreator) {
-        throw new ValidationError('Username already taken');
+        throw new ConflictError('Creator name already taken');
       }
 
       const user = await this.prisma.user.findUnique({
@@ -66,14 +77,26 @@ export class CreatorService extends BaseService {
         throw new ValidationError('User not found');
       }
 
-      const creator = await this.prisma.creator.create({
-        data: {
-          userId,
-          username: data.username,
-          displayName: data.displayName,
-          bio: data.bio,
-        },
-      });
+      let creator;
+      try {
+        creator = await this.prisma.creator.create({
+          data: {
+            userId,
+            username: data.username,
+            displayName: data.displayName,
+            bio: data.bio,
+          },
+        });
+      } catch (error: any) {
+        if (
+          error?.code === 'P2002' ||
+          (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') ||
+          error?.message?.includes('Unique constraint failed')
+        ) {
+          throw new ConflictError('Creator name already taken');
+        }
+        throw error;
+      }
 
       // Update user role to creator
       await this.prisma.user.update({
@@ -89,7 +112,7 @@ export class CreatorService extends BaseService {
     return this.executeWithLogging('creator.getByUsername', async () => {
       const cacheKey = createCacheKey(CacheType.CREATOR, `username:${username}`);
 
-      return getOrFetch({
+      const result = await getOrFetch({
         key: cacheKey,
         type: CacheType.CREATOR,
         fetchFn: async () => {
@@ -105,6 +128,7 @@ export class CreatorService extends BaseService {
           return creator;
         },
       });
+      return this.formatCreatorProfile(result);
     });
   }
 
@@ -112,7 +136,7 @@ export class CreatorService extends BaseService {
     return this.executeWithLogging('creator.getById', async () => {
       const cacheKey = createCacheKey(CacheType.CREATOR, creatorId);
 
-      return getOrFetch({
+      const result = await getOrFetch({
         key: cacheKey,
         type: CacheType.CREATOR,
         fetchFn: async () => {
@@ -128,6 +152,7 @@ export class CreatorService extends BaseService {
           return creator;
         },
       });
+      return this.formatCreatorProfile(result);
     });
   }
 
@@ -154,7 +179,7 @@ export class CreatorService extends BaseService {
       }
       await invalidateCaches(creatorCacheKeys(creatorId, creator.username), 'creator.updated');
 
-      return creator;
+      return this.formatCreatorProfile(creator);
     });
   }
 
@@ -162,7 +187,7 @@ export class CreatorService extends BaseService {
     return this.executeWithLogging('creator.getByUserId', async () => {
       const cacheKey = createCacheKey(CacheType.CREATOR, `userId:${userId}`);
 
-      return getOrFetch({
+      const result = await getOrFetch({
         key: cacheKey,
         type: CacheType.CREATOR,
         fetchFn: async () => {
@@ -178,6 +203,7 @@ export class CreatorService extends BaseService {
           return creator;
         },
       });
+      return this.formatCreatorProfile(result);
     });
   }
 
@@ -232,10 +258,11 @@ export class CreatorService extends BaseService {
       ]);
 
       const totalPages = Math.ceil(total / safePageSize);
+      const formattedCreators = creators.map((c) => this.formatCreatorProfile(c));
 
       return {
-        creators,
-        items: creators,
+        creators: formattedCreators,
+        items: formattedCreators,
         total,
         page: safePage,
         pageSize: safePageSize,

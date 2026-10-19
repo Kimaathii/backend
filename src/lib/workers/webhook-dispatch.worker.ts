@@ -7,13 +7,14 @@ import { logger } from '../../utils/logger';
 import { executeWithBreaker, CircuitBreakerOpenError } from '../circuit-breaker';
 import { createWebhookSignature } from '../../domains/webhooks/webhook.events';
 import { requestIdHeaders } from '../requestContext';
+import { withWorkerContext, runWithJobContext } from './middleware';
 
 const prisma = new PrismaClient();
 
 export function createWebhookDispatchWorker() {
   const worker = new Worker(
     QUEUE_NAMES.webhookDispatch,
-    async (job: Job) => {
+    withWorkerContext(async (job: Job) => {
       const { webhookId, eventType, payload, eventId } = job.data;
 
       logger.info(`Dispatching webhook ${webhookId} for ${eventType} event`);
@@ -124,7 +125,7 @@ export function createWebhookDispatchWorker() {
         delivered: true,
         status: response.status,
       };
-    },
+    }),
     {
       connection: bullConnection,
       concurrency: config.WORKER_CONCURRENCY,
@@ -139,34 +140,36 @@ export function createWebhookDispatchWorker() {
       return;
     }
 
-    const maxAttempts = Number(job.opts.attempts ?? 5);
-    const exhausted = job.attemptsMade >= maxAttempts;
+    await runWithJobContext(job, async () => {
+      const maxAttempts = Number(job.opts.attempts ?? 5);
+      const exhausted = job.attemptsMade >= maxAttempts;
 
-    logger.error(`Webhook dispatch worker failed job ${job.id}:`, error);
+      logger.error(`Webhook dispatch worker failed job ${job.id}:`, error);
 
-    if (!exhausted) {
-      return;
-    }
-
-    const eventId = job.data.eventId;
-
-    if (eventId) {
-      try {
-        await prisma.webhookEvent.update({
-          where: { id: eventId },
-          data: {
-            status: 'failed',
-            attempts: job.attemptsMade,
-            lastError: error.message,
-            updatedAt: new Date(),
-          },
-        });
-      } catch (updateError) {
-        logger.error(`Failed to mark webhook event ${eventId} as failed:`, updateError);
+      if (!exhausted) {
+        return;
       }
-    }
 
-    await moveToDeadLetter(QUEUE_NAMES.webhookDispatch, String(job.id), job.data, error.message);
+      const eventId = job.data.eventId;
+
+      if (eventId) {
+        try {
+          await prisma.webhookEvent.update({
+            where: { id: eventId },
+            data: {
+              status: 'failed',
+              attempts: job.attemptsMade,
+              lastError: error.message,
+              updatedAt: new Date(),
+            },
+          });
+        } catch (updateError) {
+          logger.error(`Failed to mark webhook event ${eventId} as failed:`, updateError);
+        }
+      }
+
+      await moveToDeadLetter(QUEUE_NAMES.webhookDispatch, String(job.id), job.data, error.message);
+    });
   });
 
   worker.on('error', (error) => {

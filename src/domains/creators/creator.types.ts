@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { sanitizeText, TEXT_LIMITS } from '../../utils/sanitization';
 
 export const CreateCreatorRequestSchema = z.object({
   username: z
@@ -7,12 +8,20 @@ export const CreateCreatorRequestSchema = z.object({
     .max(30, 'Username must be at most 30 characters')
     .regex(/^[a-zA-Z0-9_-]+$/, 'Username can only contain letters, numbers, underscore, and dash'),
   displayName: z.string().optional(),
-  bio: z.string().max(500, 'Bio must be at most 500 characters').optional(),
+  bio: z
+    .string()
+    .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.BIO }))
+    .max(500, 'Bio must be at most 500 characters')
+    .optional(),
 });
 
 export const UpdateCreatorRequestSchema = z.object({
   displayName: z.string().optional(),
-  bio: z.string().max(500).optional(),
+  bio: z
+    .string()
+    .transform((value) => sanitizeText(value, { maxLength: TEXT_LIMITS.BIO }))
+    .max(500)
+    .optional(),
   avatar: z.string().url().optional(),
   isPublic: z.boolean().optional(),
 });
@@ -70,6 +79,11 @@ export interface CreatorPayoutResponse {
   pendingBalance: number;
 }
 
+export interface CreatorBadge {
+  verified: boolean;
+  type: string;
+}
+
 export interface CreatorResponse {
   id: string;
   userId: string;
@@ -78,6 +92,8 @@ export interface CreatorResponse {
   bio: string | null;
   avatar: string | null;
   verified: boolean;
+  badge?: CreatorBadge | null;
+  verificationBadge?: boolean;
   isPublic: boolean;
   totalEarnings: number;
   pendingBalance: number;

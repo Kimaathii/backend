@@ -59,7 +59,7 @@ export async function registerSecurityPlugins(app: FastifyInstance): Promise<voi
     origin: origins,
     credentials: config.CORS_CREDENTIALS,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Request-ID'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Request-ID', 'X-CSRF-Token'],
     // Rate-limit metadata must be exposed for browsers to read it (#1).
     exposedHeaders: [
       'X-Request-Id',
@@ -74,4 +74,17 @@ export async function registerSecurityPlugins(app: FastifyInstance): Promise<voi
   });
 
   app.addHook('onRequest', rateLimitCorsPreflight);
+
+  // Ensure security headers on all responses (#251, #252)
+  app.addHook('onSend', async (request, reply) => {
+    reply.header('x-content-type-options', 'nosniff');
+    const isEmbedAllowed =
+      request.url.startsWith('/embed') ||
+      request.headers['x-allow-embed'] === 'true';
+    if (isEmbedAllowed) {
+      reply.header('x-frame-options', 'SAMEORIGIN');
+    } else if (!reply.getHeader('x-frame-options')) {
+      reply.header('x-frame-options', 'DENY');
+    }
+  });
 }

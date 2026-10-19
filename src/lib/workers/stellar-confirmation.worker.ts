@@ -1,4 +1,4 @@
-import { Worker, Job } from 'bullmq';
+import { Worker, Job } from 'Bullmq';
 import { PrismaClient } from '@prisma/client';
 import { bullConnection, backoffStrategy, moveToDeadLetter, QUEUE_NAMES } from '../queue';
 import { config } from '../../config/env';
@@ -6,6 +6,7 @@ import { logger } from '../../utils/logger';
 import { checkTransactionStatus } from '../stellar/transactions';
 import { PaymentService } from '../../domains/payments/payment.service';
 import { TipStatus } from '../../domains/payments/payment.types';
+import { withWorkerContext, runWithJobContext } from './middleware';
 
 const prisma = new PrismaClient();
 const paymentService = new PaymentService(prisma);
@@ -13,7 +14,7 @@ const paymentService = new PaymentService(prisma);
 export function createStellarConfirmationWorker() {
   const worker = new Worker(
     QUEUE_NAMES.stellarConfirmation,
-    async (job: Job) => {
+    withWorkerContext(async (job: Job) => {
       // payment.service passes { transactionId, transactionHash }
       const tipId = job.data.tipId || job.data.transactionId;
       const transactionHash = job.data.transactionHash;
@@ -48,7 +49,7 @@ export function createStellarConfirmationWorker() {
       logger.debug(`Transaction not confirmed yet for tip ${tipId}, will retry`);
 
       throw new Error('Transaction not confirmed yet');
-    },
+    }),
     {
       connection: bullConnection,
       concurrency: config.WORKER_CONCURRENCY,
@@ -59,30 +60,38 @@ export function createStellarConfirmationWorker() {
   );
 
   worker.on('completed', (job) => {
-    logger.info(`Stellar confirmation worker completed job ${job.id}`);
+    runWithJobContext(job, () => {
+      logger.info(`Stellar confirmation worker completed job ${job.id}`);
+    });
   });
 
   worker.on('failed', async (job, error) => {
-    logger.error(`Stellar confirmation worker failed job ${job?.id}:`, error);
-
-    if (job && job.attemptsMade >= (job.opts.attempts ?? 5)) {
-      const tipId = job.data.tipId || job.data.transactionId;
-
-      try {
-        await paymentService.updateTipStatus(tipId, {
-          status: TipStatus.FAILED,
-        });
-      } catch (updateError) {
-        logger.error(`Failed to mark tip ${tipId} as FAILED:`, updateError);
-      }
-
-      await moveToDeadLetter(
-        QUEUE_NAMES.stellarConfirmation,
-        String(job.id),
-        job.data,
-        error.message
-      );
+    if (!job) {
+      logger.error('Stellar confirmation worker failed job:', error);
+      return;
     }
+    await runWithJobContext(job, async () => {
+      logger.error(`Stellar confirmation worker failed job ${job?.id}:`, error);
+
+      if (job.attemptsMade >= (job.opts.attempts ?? 5)) {
+        const tipId = job.data.tipId || job.data.transactionId;
+
+        try {
+          await paymentService.updateTipStatus(tipId, {
+            status: TipStatus.FAILED,
+          });
+        } catch (updateError) {
+          logger.error(`Failed to mark tip ${tipId} as FAILED:`, updateError);
+        }
+
+        await moveToDeadLetter(
+          QUEUE_NAMES.stellarConfirmation,
+          String(job.id),
+          job.data,
+          error.message
+        );
+      }
+    });
   });
 
   return worker;
