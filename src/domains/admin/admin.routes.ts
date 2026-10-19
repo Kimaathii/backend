@@ -32,6 +32,72 @@ export const registerAdminRoutes = (app: FastifyInstance, prisma: PrismaClient):
     }
   );
 
+  // POST /api/admin/payments/bulk-refund - Bulk refund payments
+  const bulkRefundHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const user = request.user;
+      if (!user) throw new UnauthorizedError('User not authenticated');
+      const body = request.body as { paymentIds: string[]; reason?: string };
+      const result = await adminService.bulkRefundPayments(
+        user.userId,
+        body.paymentIds,
+        body.reason
+      );
+      return reply.code(200).send(formatSuccess(result));
+    } catch (error) {
+      if (error instanceof AppError) {
+        return reply.code(error.statusCode).send(formatError(error.message, error.code));
+      }
+      throw error;
+    }
+  };
+
+  app.post<{ Body: { paymentIds: string[]; reason?: string } }>(
+    '/api/v1/admin/payments/bulk-refund',
+    { preHandler: requireAdmin },
+    bulkRefundHandler
+  );
+
+  app.post<{ Body: { paymentIds: string[]; reason?: string } }>(
+    '/api/admin/payments/bulk-refund',
+    { preHandler: requireAdmin },
+    bulkRefundHandler
+  );
+
+  // POST /api/admin/creators/:creatorId/verify - Admin verify creator with documentation and badge
+  const verifyCreatorDirectHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const user = request.user;
+      if (!user) throw new UnauthorizedError('User not authenticated');
+      const { creatorId } = request.params as { creatorId: string };
+      const body = (request.body as { reason: string; notes?: string }) ?? {};
+      const result = await adminService.verifyCreatorDirect(
+        user.userId,
+        creatorId,
+        body.reason,
+        body.notes
+      );
+      return reply.code(200).send(formatSuccess(result));
+    } catch (error) {
+      if (error instanceof AppError) {
+        return reply.code(error.statusCode).send(formatError(error.message, error.code));
+      }
+      throw error;
+    }
+  };
+
+  app.post<{ Params: { creatorId: string }; Body: { reason: string; notes?: string } }>(
+    '/api/v1/admin/creators/:creatorId/verify',
+    { preHandler: requireAdmin },
+    verifyCreatorDirectHandler
+  );
+
+  app.post<{ Params: { creatorId: string }; Body: { reason: string; notes?: string } }>(
+    '/api/admin/creators/:creatorId/verify',
+    { preHandler: requireAdmin },
+    verifyCreatorDirectHandler
+  );
+
   // POST /api/admin/users/bulk-import - Bulk import users from CSV
   app.post<{ Body: { csv: string } }>(
     '/api/v1/admin/users/bulk-import',
